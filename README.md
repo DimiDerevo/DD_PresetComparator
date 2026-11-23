@@ -35,8 +35,8 @@ python preset_comparator.py "C:\path\preset1.html" "C:\path\preset2.html"
 
 ## Table format
 
-- Column 1 shows the mod name (`[L]` marks a local mod).
-- Each preset column shows the mod size.
+- Column 1 shows the mod name (`[L]` marks a local mod, `[DLC]` marks a Creator DLC).
+- Each preset column shows the mod or DLC size.
 - If the local disk size and the Steam API size match, the cell shows one value.
 - If they differ, the cell shows `Disk / API` and highlights the mismatched or missing value in yellow text.
 - An empty cell with a dark red background means that the mod is not in that preset.

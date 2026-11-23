@@ -16,6 +16,7 @@ import html
 import json
 import os
 import re
+import struct
 import sys
 import unicodedata
 import urllib.error
@@ -63,16 +64,38 @@ DATA_META_LOCAL_RE = re.compile(
     r'data-meta=["\']local:([^|]*)\|([^|]*)\|([^"\']*)["\']',
     re.IGNORECASE,
 )
+DLC_CONTAINER_RE = re.compile(
+    r'<tr[^>]*data-type=["\']DlcContainer["\'][^>]*>(.*?)</tr>',
+    re.IGNORECASE | re.DOTALL,
+)
+STEAM_STORE_APP_RE = re.compile(
+    r'href=["\']https?://store\.steampowered\.com/app/(\d+)[^"\']*["\']',
+    re.IGNORECASE,
+)
+
+# appid -> (display_name, arma3_subfolder, fallback_steam_depot_bytes)
+KNOWN_DLCS: Dict[str, Tuple[str, str, int]] = {
+    "1042220": ("Global Mobilization", "GM", 38351201034),
+    "1175380": ("Spearhead 1944", "SPE", 31183452901),
+    "1227700": ("S.O.G. Prairie Fire", "vn", 38376191891),
+    "1294440": ("CSLA Iron Curtain", "CSLA", 10479842211),
+    "1681170": ("Western Sahara", "WS", 5310872067),
+    "2647760": ("Reaction Forces", "RF", 4315226953),
+    "2647830": ("Expeditionary Forces", "EF", 3692186135),
+    "1021790": ("Contact", "Contact", 1267166926),
+}
 
 
 @dataclass
 class ModRef:
-    key: str  # "steam:<id>" or "local:<folder_lower>"
+    key: str  # "steam:<id>", "local:<folder_lower>", or "dlc:<appid>"
     name: str
     is_local: bool
     steam_id: Optional[str] = None
     local_folder: Optional[str] = None
     local_hint_path: Optional[str] = None
+    is_dlc: bool = False
+    dlc_id: Optional[str] = None
 
 
 @dataclass
@@ -205,6 +228,25 @@ def parse_html_preset(file_path: Path) -> PresetData:
                     local_folder=folder_name,
                 )
 
+    for block in DLC_CONTAINER_RE.findall(text):
+        name_match = DISPLAY_NAME_RE.search(block)
+        display_name = strip_tags(name_match.group(1)) if name_match else "Unknown DLC"
+        app_match = STEAM_STORE_APP_RE.search(block)
+        if not app_match:
+            continue
+        dlc_id = app_match.group(1)
+        if display_name == "Unknown DLC" and dlc_id in KNOWN_DLCS:
+            display_name = KNOWN_DLCS[dlc_id][0]
+        key = f"dlc:{dlc_id}"
+        if key not in mods:
+            mods[key] = ModRef(
+                key=key,
+                name=display_name,
+                is_local=False,
+                is_dlc=True,
+                dlc_id=dlc_id,
+            )
+
     return PresetData(name=file_path.stem, path=file_path, mods=mods)
 
 
@@ -235,6 +277,22 @@ def parse_preset2_xml(file_path: Path) -> PresetData:
                 is_local=True,
                 local_folder=folder_name,
                 local_hint_path=raw_path,
+            )
+
+    for dlc_elem in root.findall(".//dlcs-appids/id"):
+        val = (dlc_elem.text or "").strip()
+        if val.startswith("steam:"):
+            val = val.split(":", 1)[1].strip()
+        if val.isdigit():
+            dlc_id = val
+            name = KNOWN_DLCS[dlc_id][0] if dlc_id in KNOWN_DLCS else f"DLC {dlc_id}"
+            key = f"dlc:{dlc_id}"
+            mods[key] = ModRef(
+                key=key,
+                name=name,
+                is_local=False,
+                is_dlc=True,
+                dlc_id=dlc_id,
             )
 
     return PresetData(name=file_path.stem, path=file_path, mods=mods)
@@ -426,14 +484,144 @@ def dir_size_bytes(path: Path) -> int:
     return total
 
 
+def _find_steam_appinfo_vdf() -> Optional[Path]:
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+                steam_path, _ = winreg.QueryValueEx(k, "SteamPath")
+                if steam_path:
+                    p = Path(steam_path) / "appcache" / "appinfo.vdf"
+                    if p.is_file():
+                        return p
+        except OSError:
+            pass
+    fallback = Path(r"C:\Program Files (x86)\Steam\appcache\appinfo.vdf")
+    return fallback if fallback.is_file() else None
+
+
+def _parse_vdf_binary_kv(buf: bytes, offset: int, strings: List[str]) -> Tuple[dict, int]:
+    out: dict = {}
+    while offset < len(buf):
+        t = buf[offset]
+        offset += 1
+        if t == 8:
+            break
+        if offset + 4 > len(buf):
+            break
+        key_idx = struct.unpack("<I", buf[offset : offset + 4])[0]
+        offset += 4
+        key = strings[key_idx] if key_idx < len(strings) else str(key_idx)
+        if t == 0:
+            val, offset = _parse_vdf_binary_kv(buf, offset, strings)
+        elif t == 1:
+            end = buf.find(b"\x00", offset)
+            if end == -1:
+                break
+            val = buf[offset:end].decode("utf-8", errors="replace")
+            offset = end + 1
+        elif t == 2:
+            val = struct.unpack("<I", buf[offset : offset + 4])[0]
+            offset += 4
+        elif t == 7:
+            val = struct.unpack("<Q", buf[offset : offset + 8])[0]
+            offset += 8
+        else:
+            break
+        out[key] = val
+    return out, offset
+
+
+def load_steam_dlc_depot_sizes(arma3_dir: Optional[Path]) -> Dict[str, int]:
+    """Read Steam depot sizes for Arma 3 DLCs from appmanifest_107410.acf, appinfo.vdf, and KNOWN_DLCS."""
+    sizes: Dict[str, int] = {k: v[2] for k, v in KNOWN_DLCS.items()}
+
+    appinfo_path = _find_steam_appinfo_vdf()
+    if appinfo_path is not None:
+        try:
+            data = appinfo_path.read_bytes()
+            magic, _, str_table_offset = struct.unpack("<IIQ", data[:16])
+            if magic in (0x07564429, 0x07564428) and str_table_offset < len(data):
+                str_count = struct.unpack("<I", data[str_table_offset : str_table_offset + 4])[0]
+                pos = str_table_offset + 4
+                strings: List[str] = []
+                for _ in range(str_count):
+                    end = data.find(b"\x00", pos)
+                    if end == -1:
+                        break
+                    strings.append(data[pos:end].decode("utf-8", errors="replace"))
+                    pos = end + 1
+
+                offset = 16
+                while offset + 8 <= str_table_offset:
+                    appid = struct.unpack("<I", data[offset : offset + 4])[0]
+                    if appid == 0:
+                        break
+                    size = struct.unpack("<I", data[offset + 4 : offset + 8])[0]
+                    if appid == 107410:
+                        kv, _ = _parse_vdf_binary_kv(data, offset + 68, strings)
+                        depots = kv.get("appinfo", {}).get("depots", {})
+                        for depot_id, info in depots.items():
+                            if not isinstance(info, dict):
+                                continue
+                            cfg = info.get("config")
+                            if isinstance(cfg, dict) and cfg.get("oslist") and "windows" not in str(cfg.get("oslist")):
+                                continue
+                            dlc_appid = info.get("dlcappid")
+                            if dlc_appid is None:
+                                continue
+                            pub_size = info.get("manifests", {}).get("public", {}).get("size")
+                            if pub_size is not None:
+                                try:
+                                    sizes[str(dlc_appid)] = int(pub_size)
+                                except (TypeError, ValueError):
+                                    pass
+                        break
+                    offset += 8 + size
+        except Exception:
+            pass
+
+    if arma3_dir:
+        acf = arma3_dir.parent.parent / "appmanifest_107410.acf"
+        if acf.is_file():
+            try:
+                acf_text = acf.read_text(encoding="utf-8", errors="replace")
+                for m in re.finditer(
+                    r'"(\d+)"\s*\{[^}]*?"size"\s*"(\d+)"[^}]*?"dlcappid"\s*"(\d+)"[^}]*?\}',
+                    acf_text,
+                    re.DOTALL,
+                ):
+                    sizes[m.group(3)] = int(m.group(2))
+            except Exception:
+                pass
+
+    return sizes
+
+
 def resolve_mod_disk_path(
     mod: ModRef,
     workshop_dirs: List[Path],
     steam_cache: Dict[str, dict],
     known_local_map: Dict[str, Path],
     local_search_dirs: List[Path],
+    arma3_dir: Optional[Path] = None,
 ) -> Optional[Path]:
-    if not mod.is_local and mod.steam_id:
+    if mod.is_dlc and mod.dlc_id:
+        if arma3_dir and arma3_dir.is_dir() and mod.dlc_id in KNOWN_DLCS:
+            subfolder = KNOWN_DLCS[mod.dlc_id][1]
+            exact = arma3_dir / subfolder
+            if exact.is_dir():
+                return exact
+            try:
+                for entry in os.scandir(arma3_dir):
+                    if entry.is_dir(follow_symlinks=False) and entry.name.lower() == subfolder.lower():
+                        return Path(entry.path)
+            except OSError:
+                pass
+        return None
+
+    if not mod.is_local and not mod.is_dlc and mod.steam_id:
         for ws_dir in workshop_dirs:
             candidate = ws_dir / mod.steam_id
             if candidate.is_dir():
@@ -491,15 +679,20 @@ def resolve_all_mod_sizes(
     for p in known_local_mods:
         known_local_map[p.name.lower()] = p
 
-    _, workshop_dirs = discover_arma3_and_workshop_dirs(custom_workshop_dir)
+    arma3_dir, workshop_dirs = discover_arma3_and_workshop_dirs(custom_workshop_dir)
 
-    steam_ids = [m.steam_id for m in all_mods.values() if not m.is_local and m.steam_id]
+    steam_ids = [
+        m.steam_id for m in all_mods.values() if not m.is_local and not m.is_dlc and m.steam_id
+    ]
     steam_sizes = fetch_steam_sizes(steam_ids, steam_cache) if steam_ids else {}
+
+    has_dlcs = any(m.is_dlc for m in all_mods.values())
+    dlc_depot_sizes = load_steam_dlc_depot_sizes(arma3_dir) if has_dlcs else {}
 
     path_map: Dict[str, Optional[Path]] = {}
     for key, mod in all_mods.items():
         path_map[key] = resolve_mod_disk_path(
-            mod, workshop_dirs, steam_cache, known_local_map, local_search_dirs
+            mod, workshop_dirs, steam_cache, known_local_map, local_search_dirs, arma3_dir
         )
 
     disk_sizes: Dict[str, Optional[int]] = {}
@@ -519,7 +712,9 @@ def resolve_all_mod_sizes(
     for key, mod in all_mods.items():
         api_bytes: Optional[int] = None
         api_title: Optional[str] = None
-        if not mod.is_local and mod.steam_id and mod.steam_id in steam_sizes:
+        if mod.is_dlc and mod.dlc_id:
+            api_bytes = dlc_depot_sizes.get(mod.dlc_id)
+        elif not mod.is_local and mod.steam_id and mod.steam_id in steam_sizes:
             api_bytes, api_title = steam_sizes[mod.steam_id]
         result[key] = ModSizeInfo(
             key=key,
@@ -748,7 +943,14 @@ def render_table(
         info = size_map[mod.key]
         if name.startswith("Workshop ") and info.api_title:
             name = normalize_display_text(info.api_title)
-        suffix = " [L]" if mod.is_local else (f" [{mod.steam_id}]" if show_id and mod.steam_id else "")
+        if mod.is_dlc:
+            suffix = f" [DLC {mod.dlc_id}]" if show_id and mod.dlc_id else " [DLC]"
+        elif mod.is_local:
+            suffix = " [L]"
+        elif show_id and mod.steam_id:
+            suffix = f" [{mod.steam_id}]"
+        else:
+            suffix = ""
         return f"{name}{suffix}"
 
     def sort_key(k: str):
@@ -897,7 +1099,8 @@ def export_csv(
         for k in sorted(all_mods.keys(), key=lambda x: all_mods[x].name.lower()):
             mod = all_mods[k]
             info = size_map[k]
-            row = [mod.name, mod.key, "Local" if mod.is_local else "Steam"]
+            mod_type = "DLC" if mod.is_dlc else ("Local" if mod.is_local else "Steam")
+            row = [mod.name, mod.key, mod_type]
             for p in presets:
                 if k in p.mods:
                     row.append("" if info.api_bytes is None else str(info.api_bytes))
